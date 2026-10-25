@@ -204,6 +204,7 @@ probe::Report RunProbes(SDL_Window *window, const probe::ContextResult &context)
     if (context.isEs3) {
         probe::ProbeEs3Features(report);
         const GLuint program = probe::ProbeAcgcShaders(report);
+        probe::ProbeProgramCache(report, program);
         probe::ProbePerformance(report, program, window);
         if (program)
             probe::gl().glDeleteProgram(program);

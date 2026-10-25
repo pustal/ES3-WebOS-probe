@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -29,13 +30,13 @@ constexpr double kFrameBudget60Ms = 1000.0 / 60.0;
 /** Frame budget at 30 fps (Animal Crossing's own frame rate on the GameCube). */
 constexpr double kFrameBudget30Ms = 1000.0 / 30.0;
 /** How long each benchmark scene is measured (after warm-up). */
-constexpr Uint32 kBenchmarkMs = 2500;
+constexpr Uint32 kBenchmarkMs = 1500;
 /** Frames drawn before measuring, so shader compilation and caches settle. */
 constexpr int kWarmupFrames = 5;
 /** Measured frames wanted even when the GPU is slow, so the average means something. */
-constexpr std::size_t kMinMeasuredFrames = 10;
+constexpr std::size_t kMinMeasuredFrames = 5;
 /** Hard limit per scene, so a very slow GPU cannot keep the probe busy for minutes. */
-constexpr Uint32 kSceneTimeoutMs = 15000;
+constexpr Uint32 kSceneTimeoutMs = 8000;
 /** Size of the generated test textures. */
 constexpr int kTextureSize = 256;
 
@@ -205,27 +206,39 @@ constexpr std::array<Scene, 2> kScenes = { {
     { "Worst case", 3, 3, true, true, 4, kFrameBudget30Ms * 0.6, kFrameBudget30Ms * 1.5 },
 } };
 
-/** Uploads the uniforms for @p scene to the port's shader. */
-void ConfigureScene(GLuint program, const Scene &scene)
-{
-    Gl &g          = gl();
-    const auto loc = [&](const char *name) { return g.glGetUniformLocation(program, name); };
-
-    const std::array<float, 16> identity4 = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
-    const std::array<float, 9> identity3  = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
-    g.glUniformMatrix4fv(loc("u_projection"), 1, GL_FALSE, identity4.data());
-    g.glUniformMatrix4fv(loc("u_modelview"), 1, GL_FALSE, identity4.data());
-    g.glUniformMatrix3fv(loc("u_normal_mtx"), 1, GL_FALSE, identity3.data());
-    const std::array<GLint, 2> zero2i       = { 0, 0 };
-    const std::array<GLint, 2> texgenTex0   = { 4, 4 }; // GX_TG_TEX0 for both coordinates
-    g.glUniform1iv(loc("u_texmtx_enable"), 2, zero2i.data());
-    g.glUniform1iv(loc("u_texgen_src"), 2, texgenTex0.data());
-
-    // Per-stage TEV setup: d + mix(a, b, c) with a = ZERO, b = TEXC, c = RASC, d = CPREV (ZERO on stage 0).
+/**
+ * The values of the "folded" uniforms for a scene: the ones the port turns
+ * into constants when it builds a specialised shader variant (see
+ * s_folded_uniforms and emit_const_block in the port's pc_gx_tev.c). Used both
+ * to upload them as uniforms (uber shader) and to emit them as constants
+ * (variant), so the two programs always draw the same thing.
+ */
+struct TevSetup {
+    int numStages = 0;
     std::array<GLint, 12> colorIn{}, alphaIn{}, bsc{}, out{}, indCfg{};
     std::array<GLint, 9> indWrap{}, ksel{};
     std::array<GLint, 6> swap{};
     std::array<GLint, 3> colorOp{}, alphaOp{}, tcSrc{}, useTexture{};
+    std::array<GLint, 4> lighting0{}, lighting1{};
+    std::array<GLint, 16> swapTables = { 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3 };
+    std::array<GLint, 3> alphaCtrl = { 4, 0, 7 }; // GREATER than ref0, AND, ALWAYS: foliage cut-outs
+    int numIndStages = 0;
+    int fogEnable    = 1;
+};
+
+/** Builds the TEV configuration for @p scene. */
+TevSetup MakeTevSetup(const Scene &scene)
+{
+    TevSetup t;
+    t.numStages = scene.stages;
+    // Per-stage TEV setup: d + mix(a, b, c) with a = ZERO, b = TEXC, c = RASC, d = CPREV (ZERO on stage 0).
+    auto &colorIn = t.colorIn;
+    auto &alphaIn = t.alphaIn;
+    auto &out     = t.out;
+    auto &indCfg  = t.indCfg;
+    auto &tcSrc   = t.tcSrc;
+    auto &useTexture = t.useTexture;
+    auto &ksel    = t.ksel;
     for (int s = 0; s < 3; ++s) {
         const std::size_t i4 = static_cast<std::size_t>(s) * 4;
         colorIn[i4 + 0] = 15;
@@ -248,6 +261,77 @@ void ConfigureScene(GLuint program, const Scene &scene)
             indCfg[i4 + 2] = 3; // bias S and T
         }
     }
+    // Colour channel: vertex colour as material; per-pixel lighting with all 8 lights in the worst case.
+    t.lighting0    = { scene.lights ? 1 : 0, 1, 0, 1 };
+    t.lighting1    = { 0, 1, scene.lights ? 0xFF : 0, 0 };
+    t.numIndStages = scene.indirect ? 1 : 0;
+    return t;
+}
+
+/** GLSL list of @p count ivecN values taken from @p values, e.g. "ivec4(1,2,3,4),ivec4(...)". */
+template <std::size_t N>
+std::string IvecList(const std::array<GLint, N> &values, int width, int count)
+{
+    std::string list;
+    for (int i = 0; i < count; ++i) {
+        list += (i ? "," : "") + std::string(width == 1 ? "" : "ivec" + std::to_string(width)) + (width == 1 ? "" : "(");
+        for (int c = 0; c < width; ++c)
+            list += (c ? "," : "") + std::to_string(values[static_cast<std::size_t>(i * width + c)]);
+        list += width == 1 ? "" : ")";
+    }
+    return list;
+}
+
+/**
+ * The constant block the port prepends to a specialised fragment shader
+ * (same names, types and order as emit_const_block in pc_gx_tev.c).
+ */
+std::string VariantConstants(const TevSetup &t)
+{
+    std::ostringstream c;
+    c << "const int u_num_tev_stages = " << t.numStages << ";\n";
+    c << "const ivec4 u_tev_color_in[3] = ivec4[3](" << IvecList(t.colorIn, 4, 3) << ");\n";
+    c << "const ivec4 u_tev_alpha_in[3] = ivec4[3](" << IvecList(t.alphaIn, 4, 3) << ");\n";
+    c << "const int u_tev_color_op[3] = int[3](" << IvecList(t.colorOp, 1, 3) << ");\n";
+    c << "const int u_tev_alpha_op[3] = int[3](" << IvecList(t.alphaOp, 1, 3) << ");\n";
+    c << "const int u_tev_tc_src[3] = int[3](" << IvecList(t.tcSrc, 1, 3) << ");\n";
+    c << "const ivec4 u_tev_bsc[3] = ivec4[3](" << IvecList(t.bsc, 4, 3) << ");\n";
+    c << "const ivec4 u_tev_out[3] = ivec4[3](" << IvecList(t.out, 4, 3) << ");\n";
+    c << "const ivec2 u_tev_swap[3] = ivec2[3](" << IvecList(t.swap, 2, 3) << ");\n";
+    c << "const ivec3 u_tev_ksel[3] = ivec3[3](" << IvecList(t.ksel, 3, 3) << ");\n";
+    c << "const ivec4 u_tev_ind_cfg[3] = ivec4[3](" << IvecList(t.indCfg, 4, 3) << ");\n";
+    c << "const ivec3 u_tev_ind_wrap[3] = ivec3[3](" << IvecList(t.indWrap, 3, 3) << ");\n";
+    c << "const int u_use_texture[3] = int[3](" << IvecList(t.useTexture, 1, 3) << ");\n";
+    c << "const ivec4 u_lighting_cfg0 = " << IvecList(t.lighting0, 4, 1) << ";\n";
+    c << "const ivec4 u_lighting_cfg1 = " << IvecList(t.lighting1, 4, 1) << ";\n";
+    c << "const ivec4 u_swap_table[4] = ivec4[4](" << IvecList(t.swapTables, 4, 4) << ");\n";
+    c << "const ivec3 u_alpha_ctrl = " << IvecList(t.alphaCtrl, 3, 1) << ";\n";
+    c << "const int u_num_ind_stages = " << t.numIndStages << ";\n";
+    c << "const int u_fog_enable = " << t.fogEnable << ";\n";
+    return c.str();
+}
+
+/** Uploads the uniforms for @p scene to the port's shader (uniforms a variant folded away are simply absent). */
+void ConfigureScene(GLuint program, const Scene &scene)
+{
+    Gl &g          = gl();
+    const auto loc = [&](const char *name) { return g.glGetUniformLocation(program, name); };
+
+    const std::array<float, 16> identity4 = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    const std::array<float, 9> identity3  = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    g.glUniformMatrix4fv(loc("u_projection"), 1, GL_FALSE, identity4.data());
+    g.glUniformMatrix4fv(loc("u_modelview"), 1, GL_FALSE, identity4.data());
+    g.glUniformMatrix3fv(loc("u_normal_mtx"), 1, GL_FALSE, identity3.data());
+    const std::array<GLint, 2> zero2i     = { 0, 0 };
+    const std::array<GLint, 2> texgenTex0 = { 4, 4 }; // GX_TG_TEX0 for both coordinates
+    g.glUniform1iv(loc("u_texmtx_enable"), 2, zero2i.data());
+    g.glUniform1iv(loc("u_texgen_src"), 2, texgenTex0.data());
+
+    const TevSetup t = MakeTevSetup(scene);
+    const auto &colorIn = t.colorIn, &alphaIn = t.alphaIn, &bsc = t.bsc, &out = t.out, &indCfg = t.indCfg;
+    const auto &indWrap = t.indWrap, &ksel = t.ksel;
+    const auto &swap    = t.swap;
+    const auto &colorOp = t.colorOp, &alphaOp = t.alphaOp, &tcSrc = t.tcSrc, &useTexture = t.useTexture;
     g.glUniform1i(loc("u_num_tev_stages"), scene.stages);
     g.glUniform4iv(loc("u_tev_color_in"), 3, colorIn.data());
     g.glUniform4iv(loc("u_tev_alpha_in"), 3, alphaIn.data());
@@ -262,8 +346,7 @@ void ConfigureScene(GLuint program, const Scene &scene)
     g.glUniform3iv(loc("u_tev_ksel"), 3, ksel.data());
     g.glUniform1iv(loc("u_use_texture"), 3, useTexture.data());
 
-    const std::array<GLint, 16> swapTables = { 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3 };
-    g.glUniform4iv(loc("u_swap_table"), 4, swapTables.data());
+    g.glUniform4iv(loc("u_swap_table"), 4, t.swapTables.data());
 
     const std::array<float, 4> half = { 0.5f, 0.5f, 0.5f, 1.0f };
     g.glUniform4fv(loc("u_tev_prev"), 1, half.data());
@@ -273,11 +356,8 @@ void ConfigureScene(GLuint program, const Scene &scene)
     const std::array<float, 16> kcolors = { 1, 0.8f, 0.6f, 1, 0.5f, 0.5f, 0.5f, 1, 0.2f, 0.4f, 0.8f, 1, 1, 1, 1, 1 };
     g.glUniform4fv(loc("u_kcolor"), 4, kcolors.data());
 
-    // Colour channel: vertex colour as material; per-pixel lighting with all 8 lights in the worst case.
-    const std::array<GLint, 4> lighting0 = { scene.lights ? 1 : 0, 1, 0, 1 };
-    const std::array<GLint, 4> lighting1 = { 0, 1, scene.lights ? 0xFF : 0, 0 };
-    g.glUniform4iv(loc("u_lighting_cfg0"), 1, lighting0.data());
-    g.glUniform4iv(loc("u_lighting_cfg1"), 1, lighting1.data());
+    g.glUniform4iv(loc("u_lighting_cfg0"), 1, t.lighting0.data());
+    g.glUniform4iv(loc("u_lighting_cfg1"), 1, t.lighting1.data());
     const std::array<float, 8> chan = { 1, 1, 1, 1, 0.3f, 0.3f, 0.3f, 1 };
     g.glUniform4fv(loc("u_chan_color"), 2, chan.data());
     std::array<float, 24> lightPos{};
@@ -293,18 +373,18 @@ void ConfigureScene(GLuint program, const Scene &scene)
     g.glUniform4fv(loc("u_light_color"), 8, lightColor.data());
 
     // Alpha test (GREATER than 8/255, as foliage cut-outs do) and fog: both on in every scene.
-    const std::array<GLint, 3> alphaCtrl = { 4, 0, 7 };
+
     const std::array<GLint, 2> alphaRefs = { 8, 0 };
-    g.glUniform3iv(loc("u_alpha_ctrl"), 1, alphaCtrl.data());
+    g.glUniform3iv(loc("u_alpha_ctrl"), 1, t.alphaCtrl.data());
     g.glUniform2iv(loc("u_alpha_refs"), 1, alphaRefs.data());
-    g.glUniform1i(loc("u_fog_enable"), 1);
+    g.glUniform1i(loc("u_fog_enable"), t.fogEnable);
     const std::array<float, 4> fogParams = { 0.0f, -1.0f, 1.0f, 0.0f };
     const std::array<float, 4> fogColor  = { 0.6f, 0.75f, 1.0f, 1.0f };
     g.glUniform4fv(loc("u_fog_params"), 1, fogParams.data());
     g.glUniform4fv(loc("u_fog_color"), 1, fogColor.data());
 
     // Indirect texturing.
-    g.glUniform1i(loc("u_num_ind_stages"), scene.indirect ? 1 : 0);
+    g.glUniform1i(loc("u_num_ind_stages"), t.numIndStages);
     const std::array<float, 8> indScale = { 1, 1, 1, 1, 1, 1, 1, 1 };
     const std::array<float, 9> indRow0  = { 0.05f, 0, 0, 0.05f, 0, 0, 0.05f, 0, 0 };
     const std::array<float, 9> indRow1  = { 0, 0.05f, 0, 0, 0.05f, 0, 0, 0.05f, 0 };
@@ -518,18 +598,213 @@ GLuint ProbeAcgcShaders(Report &report)
     return program;
 }
 
-void ProbePerformance(Report &report, GLuint program, SDL_Window *window)
+namespace
 {
-    report.Section("Performance (port's TEV shader, full screen)");
-    if (!program) {
+
+/** Internal render resolutions tried, each scaled up to the window like a TV upscales. */
+struct RenderSize {
+    const char *label;
+    int width;
+    int height;
+};
+constexpr std::array<RenderSize, 3> kRenderSizes = { {
+    { "1080p", 1920, 1080 },
+    { "720p", 1280, 720 },
+    { "480p", 854, 480 }, // the GameCube's 480 lines, widened to 16:9 as the port's hor+ widescreen does
+} };
+
+/** Uniforms the port folds into constants for a variant (s_folded_uniforms in pc_gx_tev.c). */
+constexpr std::array<const char *, 19> kFoldedUniforms = {
+    "u_num_tev_stages", "u_tev_color_in", "u_tev_alpha_in", "u_tev_color_op", "u_tev_alpha_op",
+    "u_tev_tc_src",     "u_tev_bsc",      "u_tev_out",      "u_tev_swap",     "u_tev_ksel",
+    "u_tev_ind_cfg",    "u_tev_ind_wrap", "u_use_texture",  "u_lighting_cfg0", "u_lighting_cfg1",
+    "u_swap_table",     "u_alpha_ctrl",   "u_num_ind_stages", "u_fog_enable",
+};
+
+/** True if @p line declares one of the folded uniforms (whole-identifier match). */
+bool DeclaresFoldedUniform(const std::string &line)
+{
+    const std::size_t start = line.find_first_not_of(" \t");
+    if (start == std::string::npos || line.compare(start, 7, "uniform") != 0)
+        return false;
+    const auto isIdent = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+    for (const char *name : kFoldedUniforms) {
+        const std::size_t at = line.find(name);
+        const std::size_t end = at + std::char_traits<char>::length(name);
+        if (at != std::string::npos && !isIdent(line[at - 1]) && (end >= line.size() || !isIdent(line[end])))
+            return true;
+    }
+    return false;
+}
+
+/**
+ * Builds the specialised fragment shader for @p scene the way the port does:
+ * drop the folded uniform declarations and declare them as constants instead,
+ * so the compiler can remove the run-time loops, switches and indexing.
+ */
+std::string SpecialisedFragment(const Scene &scene)
+{
+    const std::string es = RewriteToEs(kAcgcFragmentShader);
+    std::istringstream lines(es);
+    std::ostringstream out;
+    std::string line;
+    bool constantsWritten = false;
+    while (std::getline(lines, line)) {
+        if (DeclaresFoldedUniform(line))
+            continue;
+        out << line << '\n';
+        // Right after the precision header, before anything can use the names.
+        if (!constantsWritten && line.rfind("precision highp sampler2D", 0) == 0) {
+            out << VariantConstants(MakeTevSetup(scene));
+            constantsWritten = true;
+        }
+    }
+    return out.str();
+}
+
+/** Compiles and links one program. @return 0 on failure; @p ms receives the compile+link time. */
+GLuint BuildProgram(const std::string &vertex, const std::string &fragment, double *ms, std::string *log)
+{
+    Gl &g              = gl();
+    const Uint64 start = SDL_GetPerformanceCounter();
+    std::string vsLog, fsLog, linkLog;
+    const GLuint vs = CompileShader(GL_VERTEX_SHADER, vertex, &vsLog);
+    const GLuint fs = CompileShader(GL_FRAGMENT_SHADER, fragment, &fsLog);
+    const GLuint program = (vs && fs) ? LinkProgram(vs, fs, &linkLog) : 0;
+    *ms = static_cast<double>(SDL_GetPerformanceCounter() - start) * 1000.0 / static_cast<double>(SDL_GetPerformanceFrequency());
+    if (vs)
+        g.glDeleteShader(vs);
+    if (fs)
+        g.glDeleteShader(fs);
+    *log = fsLog + vsLog + linkLog;
+    return program;
+}
+
+/** An off-screen colour target (texture + framebuffer) of a given size. */
+struct RenderTarget {
+    GLuint texture     = 0;
+    GLuint framebuffer = 0;
+    int width          = 0;
+    int height         = 0;
+};
+
+/** Creates an RGBA8 render target. @return A target with framebuffer 0 on failure. */
+RenderTarget MakeRenderTarget(int width, int height)
+{
+    Gl &g = gl();
+    RenderTarget target;
+    target.width  = width;
+    target.height = height;
+    g.glGenTextures(1, &target.texture);
+    g.glBindTexture(GL_TEXTURE_2D, target.texture);
+    g.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    g.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    g.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    g.glGenFramebuffers(1, &target.framebuffer);
+    g.glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+    g.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.texture, 0);
+    if (g.glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        g.glDeleteFramebuffers(1, &target.framebuffer);
+        target.framebuffer = 0;
+    }
+    g.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    return target;
+}
+
+void FreeRenderTarget(RenderTarget &target)
+{
+    Gl &g = gl();
+    if (target.framebuffer)
+        g.glDeleteFramebuffers(1, &target.framebuffer);
+    if (target.texture)
+        g.glDeleteTextures(1, &target.texture);
+    target = RenderTarget{};
+}
+
+/**
+ * Draws @p scene into @p target, scales it up to the window and measures the
+ * GPU time per frame (draw + upscale, waited for with glFinish).
+ *
+ * @return Average milliseconds per frame, or a negative value if nothing could be measured.
+ */
+double MeasureScene(GLuint program, const Scene &scene, const RenderTarget &target, SDL_Window *window, int winW, int winH,
+                    double *p95, std::size_t *frames, bool *timedOut)
+{
+    Gl &g = gl();
+    g.glUseProgram(program);
+    ConfigureScene(program, scene);
+
+    std::vector<double> frameMs;
+    const Uint32 sceneStart = SDL_GetTicks();
+    Uint32 measureStart     = 0;
+    *timedOut               = false;
+    for (int frame = 0;; ++frame) {
+        const Uint32 now = SDL_GetTicks();
+        if (frame == kWarmupFrames)
+            measureStart = now;
+        if (frame > kWarmupFrames && frameMs.size() >= kMinMeasuredFrames && SDL_TICKS_PASSED(now, measureStart + kBenchmarkMs))
+            break;
+        if (SDL_TICKS_PASSED(now, sceneStart + kSceneTimeoutMs)) {
+            *timedOut = true;
+            break;
+        }
+
+        const Uint64 t0 = SDL_GetPerformanceCounter();
+        g.glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+        g.glViewport(0, 0, target.width, target.height);
+        g.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        g.glClear(GL_COLOR_BUFFER_BIT);
+        g.glEnable(GL_BLEND);
+        for (int layer = 0; layer < scene.layers; ++layer)
+            g.glDrawArrays(GL_TRIANGLES, 0, 6);
+        g.glDisable(GL_BLEND);
+        // Scale up to the window, as the TV would show it.
+        g.glBindFramebuffer(GL_READ_FRAMEBUFFER, target.framebuffer);
+        g.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        g.glBlitFramebuffer(0, 0, target.width, target.height, 0, 0, winW, winH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        g.glFinish(); // Wait for the GPU so the time measured is the GPU's, not just command submission.
+        const Uint64 t1 = SDL_GetPerformanceCounter();
+        g.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (frame >= kWarmupFrames)
+            frameMs.push_back(static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(SDL_GetPerformanceFrequency()));
+        SDL_GL_SwapWindow(window);
+        SDL_PumpEvents(); // keep the compositor happy while measuring
+    }
+
+    *frames = frameMs.size();
+    if (frameMs.empty())
+        return -1.0;
+    double average = 0.0;
+    Summarise(frameMs, &average, p95);
+    return average;
+}
+
+/** "12.3 ms avg, 14.0 ms p95" plus a note when the scene hit the time limit. */
+std::string Timing(double average, double p95, std::size_t frames, bool timedOut)
+{
+    if (average < 0.0)
+        return "too slow to measure";
+    return Format("%.1f ms", average) + " avg, " + Format("%.1f ms", p95) + " p95" +
+           (timedOut ? " (only " + std::to_string(frames) + " frames)" : "");
+}
+
+} // namespace
+
+void ProbePerformance(Report &report, GLuint uberProgram, SDL_Window *window)
+{
+    report.Section("Performance (port's TEV shader, upscaled to the TV)");
+    if (!uberProgram) {
         report.Add(Status::Fail, "Benchmark", "skipped: the port's shader did not build");
         return;
     }
 
     Gl &g = gl();
-    int width = 0, height = 0;
-    SDL_GL_GetDrawableSize(window, &width, &height);
-    report.Add(Status::Info, "Resolution", std::to_string(width) + "x" + std::to_string(height));
+    if (!g.glGenFramebuffers || !g.glBlitFramebuffer) {
+        report.Add(Status::Fail, "Benchmark", "skipped: framebuffer functions missing");
+        return;
+    }
+    int winW = 0, winH = 0;
+    SDL_GL_GetDrawableSize(window, &winW, &winH);
 
     // Full-screen quad: position (x, y, z) and texture coordinate (u, v).
     const std::array<float, 30> quad = {
@@ -555,70 +830,104 @@ void ProbePerformance(Report &report, GLuint program, SDL_Window *window)
         g.glBindTexture(GL_TEXTURE_2D, textures[i]);
     }
     g.glActiveTexture(GL_TEXTURE0);
-
-    g.glViewport(0, 0, width, height);
-    g.glUseProgram(program);
-    g.glEnable(GL_BLEND);
     g.glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
+    std::array<RenderTarget, kRenderSizes.size()> targets{};
+    for (std::size_t r = 0; r < kRenderSizes.size(); ++r)
+        targets[r] = MakeRenderTarget(kRenderSizes[r].width, kRenderSizes[r].height);
+
+    const std::string vertex = RewriteToEs(kAcgcVertexShader);
     for (const Scene &scene : kScenes) {
-        ConfigureScene(program, scene);
-
-        std::vector<double> frameMs;
-        const Uint32 sceneStart = SDL_GetTicks();
-        Uint32 measureStart     = 0; // set when warm-up ends
-        bool timedOut           = false;
-        for (int frame = 0;; ++frame) {
-            const Uint32 now = SDL_GetTicks();
-            if (frame == kWarmupFrames)
-                measureStart = now;
-            const bool measuredEnough = frame > kWarmupFrames && frameMs.size() >= kMinMeasuredFrames &&
-                                        SDL_TICKS_PASSED(now, measureStart + kBenchmarkMs);
-            if (measuredEnough)
-                break;
-            if (SDL_TICKS_PASSED(now, sceneStart + kSceneTimeoutMs)) {
-                timedOut = true;
-                break;
-            }
-
-            const Uint64 t0 = SDL_GetPerformanceCounter();
-            g.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            g.glClear(GL_COLOR_BUFFER_BIT);
-            for (int layer = 0; layer < scene.layers; ++layer)
-                g.glDrawArrays(GL_TRIANGLES, 0, 6);
-            g.glFinish(); // Wait for the GPU so the time measured is the GPU's, not just command submission.
-            const Uint64 t1 = SDL_GetPerformanceCounter();
-            if (frame >= kWarmupFrames)
-                frameMs.push_back(static_cast<double>(t1 - t0) * 1000.0 / static_cast<double>(SDL_GetPerformanceFrequency()));
-            SDL_GL_SwapWindow(window);
-            SDL_PumpEvents(); // keep the compositor happy while measuring
+        // The uber shader is the reference from probe 0.1; at 1080p only, since it is slow.
+        if (&scene == &kScenes[0] && targets[0].framebuffer) {
+            double p95 = 0.0;
+            std::size_t frames = 0;
+            bool timedOut = false;
+            const double avg = MeasureScene(uberProgram, scene, targets[0], window, winW, winH, &p95, &frames, &timedOut);
+            report.Add(Status::Info, std::string(scene.name) + ", uber, 1080p", Timing(avg, p95, frames, timedOut));
         }
 
-        if (frameMs.empty()) {
-            report.Add(Status::Fail, scene.name, "too slow to measure (no frame finished after warm-up)");
+        // The specialised variant the port would actually use for this material.
+        double compileMs = 0.0;
+        std::string log;
+        const GLuint variant = BuildProgram(vertex, SpecialisedFragment(scene), &compileMs, &log);
+        if (!variant) {
+            report.Add(Status::Fail, std::string(scene.name) + ", variant", "does not compile");
+            report.Detail(log);
             continue;
         }
+        report.Add(compileMs <= 100.0 ? Status::Pass : Status::Warn, std::string(scene.name) + ", variant compile",
+                   Format("%.0f ms", compileMs));
 
-        double average = 0.0, p95 = 0.0;
-        Summarise(frameMs, &average, &p95);
-        const Status status = average <= scene.passMs ? Status::Pass : average <= scene.warnMs ? Status::Warn : Status::Fail;
-        report.Add(status, scene.name,
-                   Format("%.1f ms", average) + " avg, " + Format("%.1f ms", p95) + " p95 (" + std::to_string(scene.layers) +
-                       " layers, " + std::to_string(scene.stages) + " stages" + (scene.lights ? ", 8 lights" : "") +
-                       (scene.indirect ? ", indirect" : "") + ")" +
-                       (timedOut ? ", only " + std::to_string(frameMs.size()) + " frames" : ""));
+        for (std::size_t r = 0; r < kRenderSizes.size(); ++r) {
+            const std::string label = std::string(scene.name) + ", variant, " + kRenderSizes[r].label;
+            if (!targets[r].framebuffer) {
+                report.Add(Status::Fail, label, "could not create the render target");
+                continue;
+            }
+            double p95 = 0.0;
+            std::size_t frames = 0;
+            bool timedOut = false;
+            const double avg = MeasureScene(variant, scene, targets[r], window, winW, winH, &p95, &frames, &timedOut);
+            const Status status = avg < 0.0              ? Status::Fail
+                                  : avg <= scene.passMs ? Status::Pass
+                                  : avg <= scene.warnMs ? Status::Warn
+                                                        : Status::Fail;
+            report.Add(status, label, Timing(avg, p95, frames, timedOut));
+        }
+        g.glDeleteProgram(variant);
     }
 
+    report.Add(Status::Info, "Scenes", "typical: 3 layers, 2 stages; worst: 4 layers, 3 stages, 8 lights, indirect");
     report.Add(Status::Info, "Budget", Format("%.1f ms", kFrameBudget30Ms) + " per frame at 30 fps (the game's rate), " +
                                            Format("%.1f ms", kFrameBudget60Ms) + " at 60 fps");
 
-    g.glDisable(GL_BLEND);
+    for (RenderTarget &target : targets)
+        FreeRenderTarget(target);
     g.glDisableVertexAttribArray(0);
     g.glDisableVertexAttribArray(3);
     g.glBindBuffer(GL_ARRAY_BUFFER, 0);
     g.glDeleteBuffers(1, &buffer);
     g.glDeleteTextures(static_cast<GLsizei>(textures.size()), textures.data());
     g.glUseProgram(0);
+    g.glViewport(0, 0, winW, winH);
+}
+
+void ProbeProgramCache(Report &report, GLuint program)
+{
+    Gl &g = gl();
+    if (!program || !g.glGetProgramBinary || !g.glProgramBinary) {
+        report.Add(Status::Warn, "Shader cache", "program binaries unavailable");
+        return;
+    }
+
+    const GLint formats = GlInt(GL_NUM_PROGRAM_BINARY_FORMATS);
+    GLint length = 0;
+    g.glGetProgramiv(program, GL_PROGRAM_BINARY_LENGTH, &length);
+    if (formats <= 0 || length <= 0) {
+        report.Add(Status::Warn, "Shader cache", std::to_string(formats) + " binary formats: compiled shaders cannot be saved");
+        return;
+    }
+
+    // Save the compiled program and load it into a new one, as a disk cache would on the next launch.
+    std::vector<std::uint8_t> binary(static_cast<std::size_t>(length));
+    GLenum format = 0;
+    g.glGetProgramBinary(program, length, nullptr, &format, binary.data());
+
+    const Uint64 start   = SDL_GetPerformanceCounter();
+    const GLuint reload  = g.glCreateProgram();
+    g.glProgramBinary(reload, format, binary.data(), length);
+    GLint linked = GL_FALSE;
+    g.glGetProgramiv(reload, GL_LINK_STATUS, &linked);
+    const double ms = static_cast<double>(SDL_GetPerformanceCounter() - start) * 1000.0 /
+                      static_cast<double>(SDL_GetPerformanceFrequency());
+    g.glDeleteProgram(reload);
+
+    if (linked == GL_TRUE)
+        report.Add(Status::Pass, "Shader cache", "binaries work: " + std::to_string(length / 1024) + " KB, reloaded in " +
+                                                     Format("%.1f ms", ms) + " (vs a full compile)");
+    else
+        report.Add(Status::Warn, "Shader cache", "saving works but reloading failed");
 }
 
 } // namespace probe

@@ -7,7 +7,7 @@
 #   Desktop: cmake -B build && cmake --build build      (needs SDL2 and an ES 3 capable driver)
 
 cmake_minimum_required(VERSION 3.21)
-project(ES3WebOSProbe VERSION 0.1.0 LANGUAGES C CXX)
+project(ES3WebOSProbe VERSION 0.2.0 LANGUAGES C CXX)
 
 set(PROBE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${PROBE_ROOT}/cmake")

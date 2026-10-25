@@ -78,6 +78,14 @@ namespace probe
     X(PFNGLDELETETEXTURESPROC,          glDeleteTextures)                  \
     X(PFNGLPIXELSTOREIPROC,             glPixelStorei)                     \
     X(PFNGLREADPIXELSPROC,              glReadPixels)                      \
+    X(PFNGLGENFRAMEBUFFERSPROC,         glGenFramebuffers)                 \
+    X(PFNGLBINDFRAMEBUFFERPROC,         glBindFramebuffer)                 \
+    X(PFNGLFRAMEBUFFERTEXTURE2DPROC,    glFramebufferTexture2D)            \
+    X(PFNGLCHECKFRAMEBUFFERSTATUSPROC,  glCheckFramebufferStatus)          \
+    X(PFNGLDELETEFRAMEBUFFERSPROC,      glDeleteFramebuffers)              \
+    X(PFNGLBLITFRAMEBUFFERPROC,         glBlitFramebuffer)                 \
+    X(PFNGLGETPROGRAMBINARYPROC,        glGetProgramBinary)                \
+    X(PFNGLPROGRAMBINARYPROC,           glProgramBinary)                   \
     X(PFNGLFINISHPROC,                  glFinish)
 // clang-format on
 

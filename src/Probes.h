@@ -51,10 +51,18 @@ GLuint ProbeAcgcShaders(Report &report);
 
 /**
  * Measures how long the GPU takes to draw full-screen layers with the port's
- * shader, for a typical scene and a worst case, at the window's drawable size.
- * Frames are shown while measuring.
+ * shader, for a typical scene and a worst case. Uses the specialised variants
+ * the port really draws with (uber shader as reference), renders at 1080p,
+ * 720p and 480p and scales up to the window. Frames are shown while measuring.
  */
-void ProbePerformance(Report &report, GLuint acgcProgram, SDL_Window *window);
+void ProbePerformance(Report &report, GLuint uberProgram, SDL_Window *window);
+
+/**
+ * Checks whether compiled programs can be saved and reloaded
+ * (glGetProgramBinary / glProgramBinary), so the port could cache its shader
+ * variants on disk and compile each one only once.
+ */
+void ProbeProgramCache(Report &report, GLuint program);
 
 } // namespace probe
 

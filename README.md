@@ -18,17 +18,19 @@ game would compile them.
 |---|---|
 | System | webOS version, SDL build, CPU cores, RAM, drawable and panel resolution, free storage (a full disc image is ~1.4 GB) |
 | OpenGL ES context | Whether the TV gives an **ES 3.0** context (falls back to ES 2 to still show results), depth buffer, GPU vendor/renderer/version, GLSL version, uniform and texture-unit limits, `highp` in fragment shaders, extensions (ASTC, S3TC) |
-| Shaders | A GLSL ES 3.00 feature test, then the **port's own vertex and TEV fragment shaders**, rewritten to `#version 300 es` exactly as the Android port does, with compile time |
-| Performance | GPU time per frame drawing full-screen layers with the port's shader at the TV's drawing resolution: a *typical* scene (2 TEV stages, textured, fog, alpha test, 3 layers) and a *worst case* (3 stages, 3 textures, 8 per-pixel lights, indirect texturing, 4 layers) |
+| Shaders | A GLSL ES 3.00 feature test, then the **port's own vertex and TEV fragment shaders**, rewritten to `#version 300 es` exactly as the Android port does, with compile time; whether compiled programs can be saved and reloaded (a disk cache for shader variants) |
+| Performance | GPU time per frame (draw + upscale) for a *typical* scene (2 TEV stages, textured, fog, alpha test, 3 layers) and a *worst case* (3 stages, 3 textures, 8 per-pixel lights, indirect texturing, 4 layers). Uses the **specialised shader variants** the port really draws with (built like `pc_gx_tev.c`), at internal resolutions of **1080p, 720p and 480p** scaled up to the screen; the generic uber shader at 1080p is kept as a reference |
 
 Each line is marked **PASS**, **WARN** or **FAIL**; the top line gives the verdict. The game
 runs at 30 fps (33.3 ms per frame); the typical scene passes at 60% of the 60 fps budget.
+A FAIL at 1080p with a PASS at a lower resolution means the port should render internally at
+that resolution and let the TV scale it.
 
 ## Using it
 
 1. Install `dist/org.es3webosprobe.app_<version>_arm.ipk`
-   (`ares-install -d <tv> dist/org.es3webosprobe.app_0.1.0_arm.ipk`, or webOS Dev Manager).
-2. Open **ES3 Probe** on the TV. The checks and benchmark take about 10 seconds.
+   (`ares-install -d <tv> dist/org.es3webosprobe.app_0.2.0_arm.ipk`, or webOS Dev Manager).
+2. Open **ES3 Probe** on the TV. The checks and benchmark take about half a minute.
 3. Read the results on screen, or fetch the text report: its path is shown at the bottom
    (`$HOME/es3-probe-report.txt`, the app's data folder).
 

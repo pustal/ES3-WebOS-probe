@@ -1,0 +1,15 @@
+{
+    "id": "@PROBE_APP_ID@",
+    "version": "@PROJECT_VERSION@",
+    "vendor": "ES3 webOS probe",
+    "type": "native",
+    "main": "bin/es3probe",
+    "title": "ES3 Probe",
+    "icon": "icon.png",
+    "largeIcon": "largeIcon.png",
+    "iconColor": "#0a1026",
+    "appDescription": "Checks whether the TV can run an OpenGL ES 3 game renderer.",
+    "supportTouchMode": "none",
+    "useAllMouseButtons": false,
+    "requiredACG": []
+}
